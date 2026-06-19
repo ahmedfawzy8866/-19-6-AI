@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useMemo } from 'react';
-import { collection, onSnapshot, doc, updateDoc, addDoc } from 'firebase/firestore';
+import { collection, onSnapshot, addDoc } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../firebase';
+import { api } from '../lib/apiClient';
 import { Agent, ChatMessage } from '../types';
 import HighlightText from './HighlightText';
 import { motion } from 'motion/react';
@@ -93,30 +94,24 @@ export default function AgentsPage({ T, searchQuery = '' }: AgentsPageProps) {
     return () => window.removeEventListener('sierra_access_updated', handleUpdate);
   }, []);
 
-  useEffect(() => {
-    // Live Agent records
-    const unsub = onSnapshot(collection(db, 'agents'), (snap) => {
-      const loaded: Agent[] = [];
-      snap.forEach((doc) => {
-        const d = doc.data();
-        loaded.push({
-          id: doc.id,
-          name: d.name,
-          desc: d.desc,
-          emoji: d.emoji,
-          color: d.color,
-          status: d.status,
-          load: d.load,
-          tasks: d.tasks,
-          updatedAt: d.updatedAt?.toDate ? d.updatedAt.toDate() : new Date(),
-        });
-      });
-      setAgents(loaded);
-    }, (err) => {
-      handleFirestoreError(err, OperationType.LIST, 'agents');
-    });
+  const refreshAgents = async () => {
+    try {
+      const { agents: loaded } = await api.get<{ agents: any[] }>('/api/admin/agents');
+      setAgents(loaded.map((d) => ({ ...d, updatedAt: d.updatedAt ? new Date(d.updatedAt) : new Date() })));
+    } catch (err) {
+      console.error('Failed to fetch agents:', err);
+    }
+  };
 
-    // Live chat log (first 15 messages)
+  // Backend-polled agent status (replaces Firestore onSnapshot — see ARCHITECTURE_INTEGRATION.md).
+  useEffect(() => {
+    refreshAgents();
+    const interval = setInterval(refreshAgents, 15000);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    // Chat log stays on direct Firestore for now (deferred Phase B — see ARCHITECTURE_INTEGRATION.md).
     const unsubChats = onSnapshot(collection(db, 'chats'), (snap) => {
       const messages: ChatMessage[] = [];
       snap.forEach((doc) => {
@@ -135,10 +130,7 @@ export default function AgentsPage({ T, searchQuery = '' }: AgentsPageProps) {
       handleFirestoreError(err, OperationType.LIST, 'chats');
     });
 
-    return () => {
-      unsub();
-      unsubChats();
-    };
+    return () => unsubChats();
   }, []);
 
   const filteredAgents = useMemo(() => {
@@ -186,21 +178,17 @@ export default function AgentsPage({ T, searchQuery = '' }: AgentsPageProps) {
     try {
       recordAccess(agent.id, 'agents');
       // Toggle status to Running, loads 100% then drops
-      const agentRef = doc(db, 'agents', agent.id);
-      await updateDoc(agentRef, {
-        status: 'Running',
-        load: 100,
-        updatedAt: new Date()
-      });
+      await api.patch(`/api/admin/agents/${agent.id}`, { status: 'Running', load: 100 });
+      await refreshAgents();
       setTimeout(async () => {
-        await updateDoc(agentRef, {
+        await api.patch(`/api/admin/agents/${agent.id}`, {
           status: 'Online',
           load: Math.floor(Math.random() * 30) + 50,
-          updatedAt: new Date()
         });
+        await refreshAgents();
       }, 1500);
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `agents/${agent.id}`);
+      console.error(`Failed to restart agent ${agent.id}:`, err);
     }
   };
 

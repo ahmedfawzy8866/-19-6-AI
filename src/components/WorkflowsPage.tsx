@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useMemo } from 'react';
-import { collection, onSnapshot, doc, updateDoc, setDoc } from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType } from '../firebase';
+import { doc, onSnapshot, setDoc } from 'firebase/firestore';
+import { db } from '../firebase';
+import { api } from '../lib/apiClient';
 import { Workflow } from '../types';
 import HighlightText from './HighlightText';
 import { motion } from 'motion/react';
@@ -88,15 +89,14 @@ export default function WorkflowsPage({ T, isAr, searchQuery = '' }: WorkflowsPa
     };
   }, []);
 
-  useEffect(() => {
-    const unsub = onSnapshot(collection(db, 'workflows'), (snap) => {
-      const loaded: Workflow[] = [];
-      snap.forEach((doc) => {
-        const d = doc.data();
+  const refreshWorkflows = async () => {
+    try {
+      const { workflows: loaded } = await api.get<{ workflows: any[] }>('/api/admin/workflows');
+      const mapped: Workflow[] = loaded.map((d) => {
         const key = d.name || '';
         const fallback = WORKFLOW_FALLBACKS[key];
-        loaded.push({
-          id: doc.id,
+        return {
+          id: d.id,
           name: d.name,
           nameAr: d.nameAr || fallback?.nameAr || d.name,
           desc: d.desc || fallback?.descEn || '',
@@ -105,15 +105,20 @@ export default function WorkflowsPage({ T, isAr, searchQuery = '' }: WorkflowsPa
           runs: d.runs,
           last: d.last,
           color: d.color,
-          updatedAt: d.updatedAt?.toDate ? d.updatedAt.toDate() : new Date(),
-        });
+          updatedAt: d.updatedAt ? new Date(d.updatedAt) : new Date(),
+        };
       });
-      setWorkflows(loaded.sort((a,b) => a.id.localeCompare(b.id)));
-    }, (err) => {
-      handleFirestoreError(err, OperationType.LIST, 'workflows');
-    });
+      setWorkflows(mapped.sort((a, b) => a.id.localeCompare(b.id)));
+    } catch (err) {
+      console.error('Failed to fetch workflows:', err);
+    }
+  };
 
-    return () => unsub();
+  // Backend-polled list (replaces Firestore onSnapshot — see ARCHITECTURE_INTEGRATION.md).
+  useEffect(() => {
+    refreshWorkflows();
+    const interval = setInterval(refreshWorkflows, 15000);
+    return () => clearInterval(interval);
   }, []);
 
   const filteredWorkflows = useMemo(() => {
@@ -160,14 +165,11 @@ export default function WorkflowsPage({ T, isAr, searchQuery = '' }: WorkflowsPa
 
   const updateWorkflowStatus = async (id: string, nextStatus: string) => {
     recordAccess(id, 'workflows');
-    const ref = doc(db, 'workflows', id);
     try {
-      await updateDoc(ref, {
-        status: nextStatus,
-        updatedAt: new Date()
-      });
+      await api.patch(`/api/admin/workflows/${id}`, { status: nextStatus });
+      await refreshWorkflows();
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `workflows/${id}`);
+      console.error(`Failed to update workflow ${id}:`, err);
     }
   };
 
@@ -181,14 +183,10 @@ export default function WorkflowsPage({ T, isAr, searchQuery = '' }: WorkflowsPa
       for (const wf of workflows) {
         if (wf.status === 'active') {
           recordAccess(wf.id, 'workflows');
-          const ref = doc(db, 'workflows', wf.id);
-          await updateDoc(ref, {
-            runs: wf.runs + 1,
-            last: 'Just now',
-            updatedAt: new Date()
-          });
+          await api.patch(`/api/admin/workflows/${wf.id}`, { runs: wf.runs + 1, last: 'Just now' });
         }
       }
+      await refreshWorkflows();
     } catch (err) {
       console.error(err);
     } finally {
