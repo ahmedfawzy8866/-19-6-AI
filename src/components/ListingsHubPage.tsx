@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useMemo, FormEvent } from 'react';
-import { collection, onSnapshot, doc, deleteDoc, updateDoc, addDoc, serverTimestamp } from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType } from '../firebase';
+import { api } from '../lib/apiClient';
 import { Listing } from '../types';
 import HighlightText from './HighlightText';
 import { motion } from 'motion/react';
@@ -70,10 +69,9 @@ export default function ListingsHubPage({ T, searchQuery = '' }: ListingsHubPage
     if (!confirm(`Update status to ${status} for ${selectedIds.size} listings?`)) return;
     try {
       await Promise.all(
-        Array.from(selectedIds).map((id) =>
-          updateDoc(doc(db, 'listings', id as string), { status, updatedAt: serverTimestamp() })
-        )
+        Array.from(selectedIds).map((id) => api.patch(`/api/admin/listings/${id}`, { status }))
       );
+      await refreshListings();
       setSelectedIds(new Set());
     } catch (err) {
       console.error(err);
@@ -138,63 +136,48 @@ export default function ListingsHubPage({ T, searchQuery = '' }: ListingsHubPage
       return;
     }
 
+    const payload = {
+      ...formData,
+      beds: parseInt(formData.beds, 10) || 0,
+      area: parseInt(formData.area, 10) || 0,
+    };
+
     try {
       if (editingId) {
-        await updateDoc(doc(db, 'listings', editingId), {
-          ...formData,
-          beds: parseInt(formData.beds, 10) || 0,
-          area: parseInt(formData.area, 10) || 0,
-          updatedAt: serverTimestamp(),
-        });
+        await api.patch(`/api/admin/listings/${editingId}`, payload);
       } else {
-        await addDoc(collection(db, 'listings'), {
-          ...formData,
-          beds: parseInt(formData.beds, 10) || 0,
-          area: parseInt(formData.area, 10) || 0,
-          ai: 8.5, // Default score
-          img: Math.floor(Math.random() * 5),
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+        await api.post('/api/admin/listings', payload);
       }
+      await refreshListings();
       setIsModalOpen(false);
     } catch (err) {
+      console.error('Failed to save listing:', err);
       setFormError('Failed to save listing.');
-      handleFirestoreError(err, editingId ? OperationType.UPDATE : OperationType.CREATE, 'listings');
     }
   };
 
-  useEffect(() => {
-    const unsub = onSnapshot(
-      collection(db, 'listings'),
-      (snap) => {
-        const loaded: Listing[] = [];
-        snap.forEach((doc) => {
-          const d = doc.data();
-          loaded.push({
-            id: doc.id,
-            code: d.code,
-            cmp: d.cmp,
-            type: d.type,
-            beds: d.beds,
-            area: d.area,
-            price: d.price,
-            ai: d.ai,
-            status: d.status,
-            img: d.img || 0,
-            createdAt: d.createdAt?.toDate ? d.createdAt.toDate() : new Date(),
-            updatedAt: d.updatedAt?.toDate ? d.updatedAt.toDate() : new Date(),
-          });
-        });
-        setListings(loaded);
-        setLoading(false);
-      },
-      (err) => {
-        handleFirestoreError(err, OperationType.LIST, 'listings');
-      }
-    );
+  const refreshListings = async () => {
+    try {
+      const { listings: loaded } = await api.get<{ listings: any[] }>('/api/admin/listings');
+      setListings(
+        loaded.map((d) => ({
+          ...d,
+          createdAt: d.createdAt ? new Date(d.createdAt) : new Date(),
+          updatedAt: d.updatedAt ? new Date(d.updatedAt) : new Date(),
+        }))
+      );
+    } catch (err) {
+      console.error('Failed to fetch listings:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
 
-    return () => unsub();
+  // Backend-polled list (replaces Firestore onSnapshot — see ARCHITECTURE_INTEGRATION.md).
+  useEffect(() => {
+    refreshListings();
+    const interval = setInterval(refreshListings, 15000);
+    return () => clearInterval(interval);
   }, []);
 
   // Compute compounds dynamic list
@@ -273,9 +256,10 @@ export default function ListingsHubPage({ T, searchQuery = '' }: ListingsHubPage
   const handleListingDelete = async (id: string, code: string) => {
     if (!confirm(`Remove listing ${code} from registry?`)) return;
     try {
-      await deleteDoc(doc(db, 'listings', id));
+      await api.delete(`/api/admin/listings/${id}`);
+      await refreshListings();
     } catch (err) {
-      handleFirestoreError(err, OperationType.DELETE, `listings/${id}`);
+      console.error(`Failed to delete listing ${id}:`, err);
     }
   };
 
@@ -339,9 +323,9 @@ export default function ListingsHubPage({ T, searchQuery = '' }: ListingsHubPage
           });
           
           if (!item['Code'] || !item['Compound']) continue;
-          
+
           try {
-            await addDoc(collection(db, 'listings'), {
+            await api.post('/api/admin/listings', {
               code: item['Code'],
               cmp: item['Compound'],
               type: item['Type'] || 'Apartment',
@@ -349,16 +333,13 @@ export default function ListingsHubPage({ T, searchQuery = '' }: ListingsHubPage
               area: parseInt(item['Area'], 10) || 0,
               price: item['Price'] || '1M',
               status: item['Status'] || 'Active',
-              ai: parseFloat(item['AVM_Score']) || 8.5,
-              img: Math.floor(Math.random() * 5),
-              createdAt: serverTimestamp(),
-              updatedAt: serverTimestamp(),
             });
             added++;
           } catch(err) {
             errors++;
           }
         }
+        await refreshListings();
         alert(`Import complete! Added ${added} listings. ${errors > 0 ? `Errors: ${errors}` : ''}`);
       } catch (err) {
         console.error("Import error:", err);
